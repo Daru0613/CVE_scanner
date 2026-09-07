@@ -1,0 +1,22 @@
+# Local input data and generated reports
+자료/
+보고서/
+reports/
+*.txt
+*.csv
+*.json
+!package.json
+
+# Local caches and Python bytecode
+.cache/
+__pycache__/
+*.py[cod]
+
+# Local environment and editor files
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.vscode/
+
