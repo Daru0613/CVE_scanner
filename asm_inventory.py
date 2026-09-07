@@ -52,6 +52,8 @@ def build_inventory(observation, schema, cves, nvd_enabled, tls_check=None):
             state, action = '미점검', '접속 실패 또는 요청 제한 해결 후 재점검'
         elif result.get('key_hits', 0):
             state, action = '노출 의심', '키 종류·권한·공개 의도 확인; 비밀 키면 교체'
+        elif result.get('exposure_findings'):
+            state, action = '노출 의심', '공개 의도와 실제 민감정보 포함 여부 확인; 불필요하면 즉시 접근 차단'
         elif matches:
             state, action = '추가 확인', '필드명 일치만 확인됨; 내부 스키마·공개 정책과 대조'
         elif result['status'] in {'401', '403'}:
@@ -76,6 +78,8 @@ def build_inventory(observation, schema, cves, nvd_enabled, tls_check=None):
             evidence += '; 일치 필드: ' + ', '.join(matches[:6])
             if len(matches) > 6:
                 evidence += f' 외 {len(matches) - 6}개'
+        if result.get('exposure_findings'):
+            evidence += '; 노출 신호: ' + ', '.join(result['exposure_findings'])
         if result.get('truncated'):
             evidence += '; 응답 잘림'
             if state == '관찰됨':

@@ -13,6 +13,18 @@ from typing import Any
 USER_AGENT = "Authorized-Exposure-Triage/0.4"
 
 
+def unique_values(values, limit: int) -> list[str]:
+    """Deduplicate without changing the public source's observation order."""
+    result = []
+    for value in values:
+        text = str(value)
+        if text and text not in result:
+            result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def _json_get(url: str, timeout: int) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
@@ -47,10 +59,10 @@ def query_shodan_internetdb(addresses: list[str], timeout: int, limit: int = 2) 
         findings.append({
             "ip": str(ip),
             "ports": sorted({int(port) for port in payload.get("ports", []) if isinstance(port, int)})[:50],
-            "hostnames": sorted({str(value).lower().rstrip(".") for value in payload.get("hostnames", []) if value})[:20],
-            "cpes": sorted({str(value) for value in payload.get("cpes", []) if value})[:20],
-            "vulns": sorted({str(value) for value in payload.get("vulns", []) if value})[:30],
-            "tags": sorted({str(value) for value in payload.get("tags", []) if value})[:20],
+            "hostnames": unique_values((str(value).lower().rstrip(".") for value in payload.get("hostnames", [])), 20),
+            "cpes": unique_values(payload.get("cpes", []), 20),
+            "vulns": unique_values(payload.get("vulns", []), 30),
+            "tags": unique_values(payload.get("tags", []), 20),
             "source": f"https://internetdb.shodan.io/{ip}",
         })
     return findings

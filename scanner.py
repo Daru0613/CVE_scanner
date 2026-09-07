@@ -423,6 +423,8 @@ def parse_args() -> argparse.Namespace:
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--sample", type=Path, help="sanitized JSON, CSV, or pasted CSV text")
     inputs.add_argument("--sample-dir", type=Path, help="combine all TXT files directly inside this site's folder")
+    inputs.add_argument("--site-only", action="store_true",
+                        help="run non-invasive site/ASM checks without a supplied data sample")
     parser.add_argument("--encoding", choices=("utf-8-sig", "cp949", "euc-kr"), default="utf-8-sig", help="sample text encoding")
     parser.add_argument("--site", required=True, help="authorized site URL or hostname")
     parser.add_argument("--output", type=Path, help="Markdown report path (default: site-named file in report folder)")
@@ -465,21 +467,24 @@ def main() -> int:
         if args.offline and args.nvd:
             raise ValueError("--offline cannot be combined with --nvd")
         site = validate_site(args.site)
-        inputs = sample_paths(args)
-        if args.sample_dir:
-            name = report_path(site).stem.removeprefix('www.')
-            default_output = Path('보고서') / name / f'{name}_통합.md'
-        else:
-            default_output = report_path(site)
+        inputs = [] if args.site_only else sample_paths(args)
+        # Keep every target's artifacts together, regardless of whether its
+        # sanitized input arrived as one file or a folder of TXT files.
+        name = report_path(site).stem.removeprefix('www.')
+        default_output = Path('보고서') / name / f'{name}_통합.md'
         args.output = args.output or default_output
         args.schema_output = args.schema_output or args.output.with_suffix('.schema.json')
         historical_output = args.output.with_suffix('.historical.json')
         paths = [path.resolve() for path in inputs] + [args.output.resolve(), args.schema_output.resolve(), historical_output.resolve()]
         if len(set(paths)) != len(paths):
             raise ValueError("input and output paths must be distinct")
-        rows, sources = load_samples(inputs, args.encoding)
-        schema = infer_schema(rows)
-        print(f'loaded {len(sources)} sample files; {len(rows)} records')
+        if args.site_only:
+            rows, sources, schema = [], [], []
+            print('site-only mode: no sample data loaded')
+        else:
+            rows, sources = load_samples(inputs, args.encoding)
+            schema = infer_schema(rows)
+            print(f'loaded {len(sources)} sample files; {len(rows)} records')
         observation = SiteObservation(url=site, status="offline", notes=["no site evidence collected"]) if args.offline else fetch_site(site, args.timeout)
         if not args.offline:
             observation.addresses = resolve_addresses(urllib.parse.urlsplit(site).hostname)

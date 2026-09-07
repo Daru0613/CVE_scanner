@@ -36,12 +36,14 @@ class PublicReferences(HTMLParser):
         if name and attr.get(name):
             self.references.append((tag.lower(), attr[name] or ""))
         if tag.lower() == "form":
-            self._form = {"action": attr.get("action") or "", "method": (attr.get("method") or "GET").upper(), "fields": []}
+            self._form = {"action": attr.get("action") or "", "method": (attr.get("method") or "GET").upper(), "fields": [], "password_fields": []}
             self.forms.append(self._form)
         elif tag.lower() in {"input", "select", "textarea"} and self._form is not None and attr.get("name"):
             field = attr["name"] or ""
             if field not in self._form["fields"]:
                 self._form["fields"].append(field)
+            if tag.lower() == "input" and (attr.get("type") or "text").lower() == "password":
+                self._form["password_fields"].append(field)
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "form":
@@ -99,7 +101,8 @@ def extract_forms(page_url: str, body: str, limit: int = 20) -> list[dict[str, A
         if parsed.hostname != base.hostname or parsed.username:
             continue
         results.append({"action": parsed.path or "/", "method": form["method"],
-                        "fields": sorted(form["fields"])[:30]})
+                        "fields": sorted(form["fields"])[:30],
+                        "password_fields": sorted(form["password_fields"])[:10]})
     return results
 
 
@@ -179,8 +182,12 @@ def automatic_assessment(observation: Any, schema: list[dict[str, Any]], cves: l
             suspected.append(f"{result['url']}: 키·토큰 할당 패턴 {result['key_hits']}건")
         if result.get("field_matches"):
             suspected.append(f"{result['url']}: 유출 자료와 공개 JSON 필드명 일부 일치")
+        for finding in result.get("exposure_findings", []):
+            suspected.append(f"{result['url']}: {finding}")
     sample_fields = {item["field"].rsplit(".", 1)[-1].lower() for item in schema}
     for form in getattr(observation, "forms", []):
+        if form.get("password_fields") and form.get("method") == "GET":
+            confirmed.append(f"공개 폼 {form['action']}: 비밀번호 필드가 GET 방식으로 전송될 수 있음")
         matches = sorted(field for field in form["fields"] if field.lower() in sample_fields)
         if matches:
             suspected.append(f"공개 폼 {form['action']}: 유출 자료와 입력 필드명 일치 ({', '.join(matches[:6])})")

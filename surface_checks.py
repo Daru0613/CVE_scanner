@@ -12,13 +12,22 @@ from html.parser import HTMLParser
 from passive_asm import javascript_signals
 
 
-API_PATHS = ("/api", "/api/v1", "/openapi.json", "/swagger.json", "/wp-json/")
-STANDARD_PATHS = ("/robots.txt", "/sitemap.xml")
+API_PATHS = ("/api", "/api/v1", "/openapi.json", "/swagger.json", "/wp-json/", "/graphql")
+EXPOSURE_PATHS = ("/.env", "/.git/config", "/server-status", "/actuator", "/actuator/env", "/metrics", "/debug")
+STANDARD_PATHS = ("/robots.txt", "/sitemap.xml", "/.well-known/security.txt")
 BODY_LIMIT = 250_000
 MAX_SCRIPTS = 8
 KEY_ASSIGNMENT = re.compile(
     r'''(?i)["']?\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|client[_-]?secret)\b["']?\s*[:=]\s*["']([^"'\s]{16,256})["']'''
 )
+EXPOSURE_SIGNATURES = {
+    "디렉터리 목록": re.compile(r"<title>Index of /|<h1>Index of /", re.I),
+    "디버그·스택 추적": re.compile(r"Traceback \(most recent call last\)|Stack trace:|Whoops, looks like something went wrong", re.I),
+    "환경설정 파일": re.compile(r"(?m)^(?:APP_KEY|DB_(?:HOST|DATABASE|USERNAME|PASSWORD)|AWS_ACCESS_KEY_ID)=", re.I),
+    "Git 저장소 설정": re.compile(r"(?m)^\s*\[(?:core|remote \"origin\")\]", re.I),
+    "서버 상태 페이지": re.compile(r"Apache Server Status|Server Version:|Scoreboard Key", re.I),
+    "운영 메트릭": re.compile(r"(?m)^# (?:HELP|TYPE) [a-zA-Z_:][a-zA-Z0-9_:]*", re.I),
+}
 
 
 def secret_summary(body: str) -> str:
@@ -132,12 +141,17 @@ def inspect_response(url, kind, status, content_type, body, truncated, sample_fi
     else:
         assessment = "해당 경로의 정상 접근 미확인"
     secrets = secret_summary(body) if status != "error" else "미검사"
+    exposure_findings = []
+    if status.startswith("2"):
+        exposure_findings = [label for label, pattern in EXPOSURE_SIGNATURES.items() if pattern.search(body)]
+        if re.search(r"(?m)(?://[#@]\s*sourceMappingURL=|/\*[#@]\s*sourceMappingURL=)", body):
+            exposure_findings.append("소스맵 위치 공개")
     count = re.search(r'(\d+)건;', secrets)
     return {"url": url, "kind": kind, "status": status, "assessment": assessment,
             "key_hits": int(count.group(1)) if count else 0, "field_matches": overlap,
             "js_signals": javascript_signals(body) if kind == "JavaScript" else [],
             "truncated": truncated, "secrets": secrets,
-            "overlap": ", ".join(overlap) or "없음 / 대조 불가",
+            "overlap": ", ".join(overlap) or "없음 / 대조 불가", "exposure_findings": exposure_findings,
             "coverage": "앞 250KB만 검사; 응답 잘림" if truncated else "응답 검사 완료" if status != "error" else "응답 없음"}
 
 
@@ -145,6 +159,7 @@ def scan_surface(url: str, timeout: int, sample_fields: set[str]) -> list[dict[s
     parsed = urllib.parse.urlsplit(url)
     origin = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     pending = ([(url, "페이지")] + [(origin + path, "API 후보") for path in API_PATHS if origin + path != url]
+               + [(origin + path, "노출 후보") for path in EXPOSURE_PATHS if origin + path != url]
                + [(origin + path, "표준 파일") for path in STANDARD_PATHS])
     results = []
     for index, (target, kind) in enumerate(pending):
@@ -159,6 +174,6 @@ def scan_surface(url: str, timeout: int, sample_fields: set[str]) -> list[dict[s
                 results.append({"url": remaining, "kind": remaining_kind, "status": "skipped",
                                 "assessment": "앞선 요청 실패/제한으로 미점검", "secrets": "미검사",
                                 "key_hits": 0, "field_matches": [], "js_signals": [], "truncated": False,
-                                "overlap": "대조 불가", "coverage": "미점검"})
+                                "overlap": "대조 불가", "coverage": "미점검", "exposure_findings": []})
             break
     return results
