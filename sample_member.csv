@@ -1,0 +1,3 @@
+"mb_no","mb_id","mb_password","mb_name","mb_email","mb_hp","mb_login_ip"
+"1","sample001","[MASKED]","테스트회원","masked@example.test","[MASKED]","192.0.2.1"
+"2","sample002","[MASKED]","예제회원","masked@example.test","[MASKED]","192.0.2.2"
