@@ -29,6 +29,17 @@ def assess_asset_attribution(hostname: str, current_ips: set[str], data: dict[st
             if provider not in item["providers"]:
                 item["providers"].append(provider)
             item["hostnames"].extend(str(v).lower().rstrip(".") for v in source.get("hostnames", []) if v)
+    # Existing reverse-IP index records are co-tenancy evidence. Historical
+    # names need not still be live to disprove exclusive attribution.
+    for source in data.get("urlscan_cohosts", []):
+        ip = str(source.get("ip", ""))
+        domain = str(source.get("domain", "")).lower().rstrip(".")
+        if not ip or not domain:
+            continue
+        item = rows.setdefault(ip, {"ip": ip, "providers": [], "hostnames": []})
+        if "urlscan" not in item["providers"]:
+            item["providers"].append("urlscan")
+        item["hostnames"].append(domain)
 
     results = []
     for ip, item in rows.items():
@@ -45,7 +56,7 @@ def assess_asset_attribution(hostname: str, current_ips: set[str], data: dict[st
             evidence.append("외부 색인 호스트명 일치")
         if len(item["providers"]) >= 2:
             score += 10
-            evidence.append("Shodan·Censys 동일 IP 관측")
+            evidence.append(f"복수 공개 색인 동일 IP 관측({', '.join(item['providers'])})")
         if unrelated:
             score -= min(35, 10 + len(unrelated) * 5)
             evidence.append(f"무관 호스트명 {len(unrelated)}개 관측")
@@ -81,7 +92,13 @@ def build_product_evidence(data: dict[str, Any], attributions: list[dict[str, An
                 # A CPE with a non-wildcard version is the only exact-version
                 # evidence accepted automatically. Free-form banners stay unverified.
                 parts = text.split(":")
-                exact_version = parts[5] if text.startswith("cpe:2.3:") and len(parts) > 5 and parts[5] not in {"", "*", "-"} else ""
+                if text.startswith("cpe:2.3:") and len(parts) > 5:
+                    version = parts[5]
+                elif text.startswith("cpe:/") and len(parts) > 4:
+                    version = parts[4]
+                else:
+                    version = ""
+                exact_version = version if version not in {"", "*", "-"} else ""
                 results.append({
                     "ip": ip, "provider": str(row.get("provider") or key), "raw_evidence": text,
                     "exact_version": exact_version, "cpe": text if text.startswith("cpe:") else "",

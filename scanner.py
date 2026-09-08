@@ -31,6 +31,7 @@ from passive_asm import (analyze_cookies, analyze_security_headers, automatic_as
                          resolve_addresses)
 from osint_sources import collect_public_osint
 from historical_asm import collect_historical, probe_live_status
+from cve_prerequisites import review_external_candidates
 
 
 FIELD_RULES: dict[str, tuple[str, ...]] = {
@@ -393,6 +394,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--cve-review", action="store_true",
+        help="non-executing NVD/public-PoC prerequisite review for exactly versioned, dedicated assets",
+    )
     return parser.parse_args()
 
 
@@ -411,6 +416,8 @@ def main() -> int:
             raise ValueError("--surface-checks is disabled: endpoint scanning is outside the approved scope")
         if args.nvd:
             raise ValueError("--nvd is disabled: vulnerability verification is outside the approved scope")
+        if args.cve_review and (args.offline or args.no_osint or not args.asm):
+            raise ValueError("--cve-review requires --asm and cannot be combined with --offline or --no-osint")
         if args.credential_intel and (args.offline or args.no_osint or not args.asm):
             raise ValueError("--credential-intel requires --asm and cannot be combined with --offline or --no-osint")
         site = validate_site(args.site)
@@ -467,9 +474,13 @@ def main() -> int:
             historical_output.parent.mkdir(parents=True, exist_ok=True)
             historical_output.write_text(json.dumps(observation.historical_asm, ensure_ascii=False, indent=2), encoding='utf-8')
         tls_check = check_https(site, args.timeout) if args.asm and live_enabled and not args.offline and urllib.parse.urlsplit(site).scheme == 'http' else None
-        # CVE lookup and applicability checks are intentionally disabled.
-        nvd_enabled = False
-        cve_candidates = []
+        # This is a non-executing prerequisite comparison. Shared/unknown IPs
+        # and observations without an exact CPE version are excluded upstream.
+        nvd_enabled = args.cve_review
+        cve_candidates = (review_external_candidates(observation.external_osint, args.timeout)
+                          if args.cve_review else [])
+        if args.cve_review:
+            observation.external_osint['cve_prerequisite_reviews'] = cve_candidates
         observation.inventory = build_inventory(observation, schema, cve_candidates, nvd_enabled, tls_check)
         observation.automatic = automatic_assessment(observation, schema, cve_candidates)
         if args.manual_review:
@@ -493,7 +504,7 @@ def main() -> int:
     print(f"site status: {observation.status}")
     print(f"technologies: {', '.join(observation.technologies) or 'none detected'}")
     print("endpoint scan: disabled")
-    print("vulnerability verification: disabled")
+    print("vulnerability verification: non-executing prerequisite review" if nvd_enabled else "vulnerability verification: disabled")
     print(f"schema: {args.schema_output}")
     print(f"report: {args.output}")
     print(f"verification report: {verification_output}")

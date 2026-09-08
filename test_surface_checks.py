@@ -13,6 +13,7 @@ from env_config import load_local_env
 from osint_sources import (_is_privileged, _mask_account, build_cross_validation,
                            collect_public_osint, query_intelx_accounts, unique_values)
 from asset_attribution import assess_asset_attribution, build_product_evidence
+from cve_prerequisites import extract_poc_conditions, review_candidate, version_in_range
 
 
 class SurfaceExposureTests(unittest.TestCase):
@@ -78,11 +79,52 @@ class SurfaceExposureTests(unittest.TestCase):
         self.assertEqual("공유호스팅 추정", rows[0]["state"])
         self.assertIn("other.test", rows[0]["unrelated_hostnames"])
 
+    def test_urlscan_reverse_ip_evidence_marks_cohosting(self):
+        data = {
+            "shodan_internetdb": [{"provider": "shodan", "ip": "112.175.50.228", "hostnames": ["target.test"]}],
+            "urlscan_cohosts": [
+                {"ip": "112.175.50.228", "domain": "target.test"},
+                {"ip": "112.175.50.228", "domain": "unrelated.example"},
+            ],
+        }
+        row = assess_asset_attribution("target.test", {"112.175.50.228"}, data)[0]
+        self.assertEqual("공유호스팅 추정", row["state"])
+        self.assertIn("unrelated.example", row["unrelated_hostnames"])
+
     def test_product_without_exact_version_is_held_from_cve_mapping(self):
         data = {"censys": [{"provider": "censys", "ip": "8.8.8.8", "products": ["nginx"]}]}
         attribution = [{"ip": "8.8.8.8", "state": "대상 전용 추정"}]
         rows = build_product_evidence(data, attribution)
         self.assertEqual("CVE 매핑 보류", rows[0]["decision"])
+
+    def test_shodan_cpe22_exact_version_is_preserved(self):
+        data = {"shodan_internetdb": [{"provider": "shodan", "ip": "8.8.8.8",
+                                        "cpes": ["cpe:/a:openbsd:openssh:7.4"]}]}
+        attribution = [{"ip": "8.8.8.8", "state": "대상 전용 추정"}]
+        row = build_product_evidence(data, attribution)[0]
+        self.assertEqual("7.4", row["exact_version"])
+        self.assertEqual("CVE 후보 생성 가능", row["decision"])
+
+    def test_poc_text_is_reduced_to_non_executing_conditions(self):
+        result = extract_poc_conditions("Authentication required; plugin enabled; request /api/v1/item on Linux")
+        self.assertIn("/api/v1/item", result["paths"])
+        self.assertTrue(result["authentication_mentioned"])
+        self.assertTrue(result["module_or_configuration_mentioned"])
+        self.assertIn("linux", result["os_mentions"])
+
+    def test_version_range_comparison(self):
+        affected = {"criteria": "cpe:2.3:a:vendor:product:*:*:*:*:*:*:*:*",
+                    "versionStartIncluding": "1.2.0", "versionEndExcluding": "1.4.0"}
+        self.assertTrue(version_in_range("1.3.2", affected))
+        self.assertFalse(version_in_range("1.4.0", affected))
+
+    def test_shared_ip_is_not_sent_to_nvd_or_poc_sources(self):
+        product = {"ip": "112.175.50.228", "attribution": "공유호스팅 추정",
+                   "cpe": "cpe:2.3:a:vendor:product:1.0:*:*:*:*:*:*:*", "exact_version": "1.0"}
+        with patch("cve_prerequisites._get_text") as request:
+            result = review_candidate("CVE-2025-0001", product)
+        request.assert_not_called()
+        self.assertEqual("검증 불가", result["status"])
 
     def test_credential_intel_helpers_mask_and_flag_admin_accounts(self):
         self.assertEqual("a***@example.test", _mask_account("admin@example.test"))

@@ -242,12 +242,13 @@ def likely_routes(schema, observation, cve_candidates):
             'evidence': '유출 자료에 API 키·비밀정보 형태의 컬럼이 포함됨',
             'next': '소스·CI/CD·비밀관리 시스템의 접근 및 변경 이력을 확인',
         })
-    applicable = {row['cve_id'] for row in cve_candidates if row.get('cve_id') and 'applicability unverified' not in row.get('status', '')}
+    applicable = {row['cve_id'] for row in cve_candidates
+                  if row.get('cve_id') and row.get('status') in {'버전 일치', '전제조건 일부 일치', '영향 가능성'}}
     if applicable:
         routes.append({
-            'route': '확인된 영향 버전의 취약점', 'confidence': '중간',
-            'evidence': f"적용 가능한 CVE {len(applicable)}개 확인",
-            'next': '공격 시점의 웹 로그와 취약 경로 요청을 대조',
+            'route': '영향 가능성이 남은 CVE 후보', 'confidence': '중간',
+            'evidence': f"비침해적 전제조건 비교 후보 {len(applicable)}개; 실제 취약·악용은 미확인",
+            'next': '공식 권고의 설정 조건과 내부 패치 상태를 확인하고 공격 시점 로그를 별도 대조',
         })
     rank = {'높음': 0, '중간': 1, '낮음': 2}
     return sorted(routes, key=lambda item: rank[item['confidence']])
@@ -386,12 +387,14 @@ def write_report(path, schema, observation, findings, cve_candidates, record_cou
     collection_evidence = external.get('collection_evidence', {})
     attribution_rows = external.get('asset_attribution', [])
     product_evidence = external.get('product_evidence', [])
+    prerequisite_reviews = external.get('cve_prerequisite_reviews', [])
     credential_exposure = external.get('credential_exposure', {})
     if shodan_rows or censys_rows or urlscan_rows or provider_status or credential_exposure:
         lines += ["", "## 외부 ASM 교차검증", "",
                   "Shodan·Censys·urlscan이 이미 수집해 둔 수동 조회 결과입니다. 대상에 새 스캔을 요청하지 않으며, 현재 상태나 유출 원인을 단독으로 확정하지 않습니다.", ""]
         if provider_status:
-            labels = {'shodan_internetdb': 'Shodan', 'censys': 'Censys', 'urlscan': 'urlscan'}
+            labels = {'shodan_internetdb': 'Shodan', 'censys': 'Censys', 'urlscan': 'urlscan 도메인',
+                      'urlscan_cohosts': 'urlscan 동일 IP'}
             lines += ["| 출처 | 수집 상태 |", "| --- | --- |"]
             for key, label in labels.items():
                 lines.append(f"| {label} | {escape(provider_status.get(key, '미수집'))} |")
@@ -399,7 +402,8 @@ def write_report(path, schema, observation, findings, cve_candidates, record_cou
             lines += ["", "### 수집 상태 및 증거", "",
                       "| 출처 | 상태 | 관측 시각 | 시도 | 원시 근거 요약 | 오류 |",
                       "| --- | --- | --- | ---: | --- | --- |"]
-            labels = {'shodan_internetdb': 'Shodan', 'censys': 'Censys', 'urlscan': 'urlscan'}
+            labels = {'shodan_internetdb': 'Shodan', 'censys': 'Censys', 'urlscan': 'urlscan 도메인',
+                      'urlscan_cohosts': 'urlscan 동일 IP'}
             for key, label in labels.items():
                 item = collection_evidence.get(key, {})
                 lines.append(f"| {label} | {escape(item.get('state', '미수집'))} | {escape(item.get('observed_at', '—'))} | {item.get('attempts', 0)} | {escape(item.get('raw_evidence', '—'))} | {escape(item.get('error', '—') or '—')} |")
@@ -472,6 +476,22 @@ def write_report(path, schema, observation, findings, cve_candidates, record_cou
                       "| IP | CVE | 자산 귀속 | 판정 |", "| --- | --- | --- | --- |"]
             for ip, cve in external_cves[:30]:
                 lines.append(f"| {escape(ip)} | {escape(cve)} | {escape(attribution_by_ip.get(ip, '귀속 불명'))} | 검증 불가 · 외부 서비스 제공 후보 |")
+        if prerequisite_reviews:
+            lines += ["", "### CVE 공개 PoC 전제조건 비교", "",
+                      "PoC 코드는 실행하지 않고 공개 텍스트의 경로·인증·모듈/설정·OS 단서만 추출했습니다. 일치는 실제 취약 또는 악용 관측을 뜻하지 않습니다.", "",
+                      "| CVE | IP | 관측 버전·CPE | 공개 PoC | 추출 조건 | 판정 | 신뢰도 | 관측 시각 |",
+                      "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+            for row in prerequisite_reviews:
+                conditions = row.get('conditions', {})
+                condition_text = '; '.join(filter(None, [
+                    ('경로: ' + ', '.join(conditions.get('paths', [])[:5])) if conditions.get('paths') else '',
+                    '인증 언급' if conditions.get('authentication_mentioned') else '',
+                    '모듈/설정 언급' if conditions.get('module_or_configuration_mentioned') else '',
+                    ('OS: ' + ', '.join(conditions.get('os_mentions', []))) if conditions.get('os_mentions') else '',
+                ])) or '추출 결과 없음 / 대조 불가'
+                poc_links = '<br>'.join(f'<a href="{escape(url)}">공개 참조</a>' for url in row.get('poc_references', [])[:3]) or '없음'
+                version_cpe = f"{row.get('version', '미확인')}<br>{row.get('cpe', '미확인')}"
+                lines.append(f"| {escape(row.get('cve_id', ''))} | {escape(row.get('ip', ''))} | {version_cpe} | {poc_links} | {escape(condition_text)} | **{escape(row.get('status', '검증 불가'))}** | {escape(row.get('confidence', '낮음'))} | {escape(row.get('observed_at', ''))} |")
         if urlscan_rows:
             current_ips = set(observation.addresses.get('ipv4', [])) | set(observation.addresses.get('ipv6', []))
             same_ip = sum(1 for row in urlscan_rows if row.get('ip') in current_ips)

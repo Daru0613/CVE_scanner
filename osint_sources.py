@@ -177,6 +177,30 @@ def query_urlscan(hostname: str, timeout: int, limit: int = 10) -> list[dict[str
     return findings
 
 
+def query_urlscan_cohosts(addresses: list[str], timeout: int, limit: int = 20) -> list[dict[str, str]]:
+    """Return historical domains indexed on the IP; no scan is submitted."""
+    findings = []
+    for address in _usable_ips(addresses, 2):
+        query = urllib.parse.urlencode({"q": f"ip:{address}", "size": str(min(max(limit, 1), 50))})
+        payload = _json_get(f"https://urlscan.io/api/v1/search/?{query}", timeout)
+        for item in payload.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            page = item.get("page") if isinstance(item.get("page"), dict) else {}
+            task = item.get("task") if isinstance(item.get("task"), dict) else {}
+            domain = str(page.get("domain") or task.get("domain") or "").lower().rstrip(".")
+            if not domain or str(page.get("ip") or "") != address:
+                continue
+            row = {"provider": "urlscan", "ip": address, "domain": domain,
+                   "url": str(page.get("url") or task.get("url") or ""),
+                   "observed_at": str(task.get("time") or ""), "source": "https://urlscan.io/"}
+            if not any(old["ip"] == address and old["domain"] == domain for old in findings):
+                findings.append(row)
+            if len(findings) >= limit:
+                return findings
+    return findings
+
+
 def _mask_account(value: str) -> str:
     value = value.strip()
     if "@" in value:
@@ -305,6 +329,7 @@ def collect_public_osint(hostname: str, addresses: dict[str, list[str]], timeout
         ("shodan_internetdb", lambda: query_shodan_internetdb(addresses.get("ipv4", []), timeout), True),
         ("censys", lambda: query_censys(addresses.get("ipv4", []), timeout, os.getenv("CENSYS_API_TOKEN", "")), bool(os.getenv("CENSYS_API_TOKEN"))),
         ("urlscan", lambda: query_urlscan(hostname, timeout), True),
+        ("urlscan_cohosts", lambda: query_urlscan_cohosts(addresses.get("ipv4", []), timeout), True),
     ]
     for name, operation, configured in providers:
         if not configured:

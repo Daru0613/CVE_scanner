@@ -98,8 +98,12 @@ def build_inventory(observation, schema, cves, nvd_enabled, tls_check=None):
         points.append('회원 명부·API 응답')
     add('자료 기반 확인 지점', '추정', ' / '.join(points) or '분류 근거 부족', '사이트 보유 데이터인지와 유출 시점의 접근 로그 확인')
     ids = {row['cve_id'] for row in cves if row['cve_id']}
-    if not nvd_enabled or not cves:
+    if not nvd_enabled:
         add('취약점 검증', '미수행', '승인 범위에 따라 CVE 조회·적용 여부 검증을 수행하지 않음', '별도 승인과 내부 제품 명세가 있을 때 수행')
+    elif not cves:
+        add('CVE 전제조건 비교', '후보 없음',
+            '대상 전용 귀속·정확한 CPE 버전·외부 CVE 후보를 모두 만족한 항목 없음',
+            '공유/귀속 불명 IP의 CVE를 합산하지 말고 내부 자산·버전 자료로 보완')
     elif ids:
         add('CVE 적용 여부', '추가 확인', f'키워드 후보 {len(ids)}개; 영향 버전 미검증', '제조사 공지·실제 버전·패치·필수 설정 조건 대조')
     else:
