@@ -14,7 +14,6 @@ import json
 import re
 import ssl
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,13 +22,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from surface_checks import read_public, scan_surface
 from summary_report import report_path, write_report
 from sample_input import rows_from_csv
 from asm_inventory import build_inventory, connection_error
 from manual_review import collect_review
+from env_config import load_local_env
 from passive_asm import (analyze_cookies, analyze_security_headers, automatic_assessment,
-                         extract_endpoints, extract_forms, resolve_addresses)
+                         resolve_addresses)
 from osint_sources import collect_public_osint
 from historical_asm import collect_historical, probe_live_status
 
@@ -199,8 +198,8 @@ def collect_response(observation: SiteObservation, response: Any) -> None:
     body = response.read(250_000).decode("utf-8", errors="ignore")
     # Product banners are hints, not evidence of the origin server or vulnerability.
     detect_technologies(observation, "\n".join(observation.headers.values()) + "\n" + body)
-    observation.endpoints = extract_endpoints(observation.final_url, body)
-    observation.forms = extract_forms(observation.final_url, body)
+    # Endpoint enumeration is outside scope. Only the explicitly supplied root
+    # page is read for passive product hints and HTTP security metadata.
     if re.search(r"(?:src|href)=[\"'][^\"']*/wp-(?:content|includes)/", body, re.I):
         observation.technologies.append("wordpress")
     if 300 <= response.code < 400:
@@ -272,33 +271,6 @@ def load_samples(paths, encoding):
     return rows, sources
 
 
-def inspect_discovered_forms(observation: SiteObservation, timeout: int, limit: int = 5) -> None:
-    """GET only authentication/member pages explicitly linked by the root HTML."""
-    base = urllib.parse.urlsplit(observation.final_url or observation.url)
-    origin = urllib.parse.urlunsplit((base.scheme, base.netloc, '', '', ''))
-    paths = []
-    for endpoint in observation.endpoints:
-        if endpoint['category'] in {'authentication', 'member'} and endpoint['path'] not in paths:
-            paths.append(endpoint['path'])
-        if len(paths) == limit:
-            break
-    existing = {(form['action'], form['method'], tuple(form['fields'])) for form in observation.forms}
-    for index, path in enumerate(paths):
-        if index:
-            time.sleep(1)
-        url = urllib.parse.urljoin(origin + '/', path.lstrip('/'))
-        status, content_type, body, truncated = read_public(url, timeout)
-        observation.linked_pages.append({'url': url, 'status': status,
-                                         'result': '폼 분석 완료' if status.startswith('2') and 'html' in content_type.lower() else '폼 미확인'})
-        if not status.startswith('2') or 'html' not in content_type.lower():
-            continue
-        for form in extract_forms(url, body):
-            key = (form['action'], form['method'], tuple(form['fields']))
-            if key not in existing:
-                observation.forms.append(form)
-                existing.add(key)
-
-
 def detect_technologies(observation: SiteObservation, text: str) -> None:
     for technology, pattern in TECH_PATTERNS.items():
         match = pattern.search(text)
@@ -307,38 +279,6 @@ def detect_technologies(observation: SiteObservation, text: str) -> None:
             value = f"{technology} {version}" if version else technology
             if value not in observation.technologies:
                 observation.technologies.append(value)
-
-
-def query_nvd(technologies: list[str], timeout: int) -> list[dict[str, str]]:
-    """Query NVD keyword search for candidate CVEs; never attempts exploitation."""
-    candidates: list[dict[str, str]] = []
-    for index, technology in enumerate(technologies):
-        if not re.search(r"\b\d+(?:\.\d+)+\b", technology):
-            candidates.append({"technology": technology, "cve_id": "", "status": "skipped: exact version not detected", "source": ""})
-            continue
-        if index:
-            time.sleep(6)
-        query = urllib.parse.urlencode({"keywordSearch": technology, "resultsPerPage": "10"})
-        request = urllib.request.Request(
-            f"https://services.nvd.nist.gov/rest/json/cves/2.0?{query}",
-            headers={"User-Agent": "Authorized-Exposure-Triage/0.1"},
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                payload = json.load(response)
-            for item in payload.get("vulnerabilities", []):
-                cve_id = item.get("cve", {}).get("id")
-                if cve_id:
-                    candidates.append({"technology": technology, "cve_id": cve_id,
-                        "status": "keyword candidate; affected version and applicability unverified",
-                        "source": f"https://nvd.nist.gov/vuln/detail/{cve_id}"})
-            if not payload.get("vulnerabilities"):
-                candidates.append({"technology": technology, "cve_id": "", "status": "no keyword results; not proof of safety", "source": ""})
-            elif payload.get("totalResults", 0) > 10:
-                candidates.append({"technology": technology, "cve_id": "", "status": "truncated to 10 results; not a complete CVE assessment", "source": ""})
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
-            candidates.append({"technology": technology, "cve_id": "", "status": f"query failed: {type(error).__name__}", "source": ""})
-    return candidates
 
 
 def build_findings(
@@ -431,11 +371,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--schema-output", type=Path, help="default: alongside report as .schema.json")
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--offline", action="store_true", help="analyze schema only; no network requests")
-    parser.add_argument("--surface-checks", action="store_true", help="check public API paths and key patterns in page/linked scripts")
-    parser.add_argument("--asm", action="store_true", help="run surface checks, HTTPS check and NVD query; write an ASM inventory")
+    parser.add_argument("--surface-checks", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--asm", action="store_true", help="run passive site metadata, external-index and historical ASM checks")
     parser.add_argument("--mode", choices=("live", "historical", "full"), default="full",
                         help="ASM mode (default: full; unreachable live targets automatically use historical)")
-    parser.add_argument("--no-osint", action="store_true", help="disable Shodan InternetDB and urlscan public-history enrichment")
+    parser.add_argument("--no-osint", action="store_true", help="disable Shodan, Censys, urlscan and credential-intel lookups")
+    parser.add_argument("--credential-intel", action="store_true",
+                        help="query Intelligence X for leaked accounts; masks accounts and discards all secret values")
     parser.add_argument("--manual-review", action="store_true", help="after scanning, answer six manual verification missions")
     parser.add_argument("--claim-date", default="", help="claimed post date/time for report context")
     parser.add_argument("--claim-source", default="", help="forum or source name for report context")
@@ -449,7 +391,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--nvd",
         action="store_true",
-        help="query NVD for candidate CVE IDs based on detected public technologies",
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args()
 
@@ -460,12 +402,17 @@ def main() -> int:
         reconfigure = getattr(stream, 'reconfigure', None)
         if reconfigure:
             reconfigure(encoding='utf-8')
+    load_local_env()
     args = parse_args()
     try:
         if args.timeout <= 0:
             raise ValueError("timeout must be positive")
-        if args.offline and args.nvd:
-            raise ValueError("--offline cannot be combined with --nvd")
+        if args.surface_checks:
+            raise ValueError("--surface-checks is disabled: endpoint scanning is outside the approved scope")
+        if args.nvd:
+            raise ValueError("--nvd is disabled: vulnerability verification is outside the approved scope")
+        if args.credential_intel and (args.offline or args.no_osint or not args.asm):
+            raise ValueError("--credential-intel requires --asm and cannot be combined with --offline or --no-osint")
         site = validate_site(args.site)
         inputs = [] if args.site_only else sample_paths(args)
         # Keep every target's artifacts together, regardless of whether its
@@ -504,16 +451,11 @@ def main() -> int:
                              "date": args.claim_date, "source": args.claim_source,
                              "url": args.claim_url, "summary": args.claim_summary}
         live_enabled = args.mode in {'live', 'full'}
-        if (args.surface_checks or (args.asm and live_enabled)) and not args.offline:
-            print('checking public API paths and linked scripts...')
-            observation.surface_results = scan_surface(site, args.timeout, {item['field'] for item in schema})
-        if args.asm and live_enabled and not args.offline and observation.endpoints:
-            print('checking explicitly linked login/member forms...')
-            inspect_discovered_forms(observation, args.timeout)
-        if args.asm and live_enabled and not args.offline and not args.no_osint:
-            print('cross-checking Shodan InternetDB and urlscan public records...')
+        if args.asm and not args.offline and not args.no_osint:
+            print('cross-checking Shodan, Censys and urlscan passive records...')
             observation.external_osint = collect_public_osint(
-                urllib.parse.urlsplit(site).hostname, observation.addresses, args.timeout
+                urllib.parse.urlsplit(site).hostname, observation.addresses, args.timeout,
+                credential_intel=args.credential_intel,
             )
         historical_enabled = ((args.asm and args.mode in {'historical', 'full'}) or
                               (args.asm and (observation.status == 'error' or observation.live_status.get('status') in {'DEAD', 'DNS_FAILURE', 'TIMEOUT'})))
@@ -525,10 +467,9 @@ def main() -> int:
             historical_output.parent.mkdir(parents=True, exist_ok=True)
             historical_output.write_text(json.dumps(observation.historical_asm, ensure_ascii=False, indent=2), encoding='utf-8')
         tls_check = check_https(site, args.timeout) if args.asm and live_enabled and not args.offline and urllib.parse.urlsplit(site).scheme == 'http' else None
-        nvd_enabled = (args.nvd or (args.asm and live_enabled)) and not args.offline
-        if nvd_enabled and observation.technologies:
-            print('querying NVD candidates...')
-        cve_candidates = query_nvd(observation.technologies, args.timeout) if nvd_enabled else []
+        # CVE lookup and applicability checks are intentionally disabled.
+        nvd_enabled = False
+        cve_candidates = []
         observation.inventory = build_inventory(observation, schema, cve_candidates, nvd_enabled, tls_check)
         observation.automatic = automatic_assessment(observation, schema, cve_candidates)
         if args.manual_review:
@@ -550,7 +491,8 @@ def main() -> int:
     print(f"recognized fields: {len(schema)}")
     print(f"site status: {observation.status}")
     print(f"technologies: {', '.join(observation.technologies) or 'none detected'}")
-    print(f"CVE query rows: {len(cve_candidates)}")
+    print("endpoint scan: disabled")
+    print("vulnerability verification: disabled")
     print(f"schema: {args.schema_output}")
     print(f"report: {args.output}")
     print(f"verification report: {verification_output}")

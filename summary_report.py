@@ -181,6 +181,13 @@ def likely_routes(schema, observation, cve_candidates):
     categories = {item['category'] for item in schema}
     forms, json_rows, keys = evidence_matches(schema, observation)
     routes = []
+    credential_exposure = (getattr(observation, 'external_osint', {}) or {}).get('credential_exposure', {})
+    if credential_exposure.get('status') == 'collected' and credential_exposure.get('privileged_count', 0):
+        routes.append({
+            'route': '외부에 노출된 관리자형 계정 악용 가능성', 'confidence': '중간',
+            'evidence': f"Intelligence X 유출 계정 색인에서 고권한 가능성 후보 {credential_exposure['privileged_count']}개 관찰(계정 마스킹, 비밀값 폐기)",
+            'next': '내부 계정 목록과 마스킹 식별자를 대조하고 활성 세션 종료·비밀번호 재설정·MFA 적용·로그인 기록 확인',
+        })
     for row in observation.surface_results:
         for finding in row.get('exposure_findings', []):
             routes.append({
@@ -377,17 +384,63 @@ def write_report(path, schema, observation, findings, cve_candidates, record_cou
                       "5. API 키 패턴이 나온 파일은 Network 검색창에 파일명만 입력해 응답을 연 뒤, 값 전체를 가리고 변수명·파일 URL만 남깁니다.",
                       "6. 사진 아래에 `일치 필드 / 로그인 필요 여부 / Content-Type / 공개 의도 확인 결과`를 기록합니다."]
     shodan_rows, urlscan_rows = osint_evidence(observation)
-    if shodan_rows or urlscan_rows:
+    external = getattr(observation, 'external_osint', {}) or {}
+    censys_rows = external.get('censys', [])
+    cross_rows = external.get('cross_validation', [])
+    provider_status = external.get('collection_status', {})
+    credential_exposure = external.get('credential_exposure', {})
+    if shodan_rows or censys_rows or urlscan_rows or provider_status or credential_exposure:
         lines += ["", "## 외부 ASM 교차검증", "",
-                  "Shodan InternetDB와 urlscan의 공개·과거 관측값입니다. 현재 상태나 유출 원인을 단독으로 확정하는 근거는 아닙니다.", ""]
+                  "Shodan·Censys·urlscan이 이미 수집해 둔 수동 조회 결과입니다. 대상에 새 스캔을 요청하지 않으며, 현재 상태나 유출 원인을 단독으로 확정하지 않습니다.", ""]
+        if provider_status:
+            labels = {'shodan_internetdb': 'Shodan', 'censys': 'Censys', 'urlscan': 'urlscan'}
+            lines += ["| 출처 | 수집 상태 |", "| --- | --- |"]
+            for key, label in labels.items():
+                lines.append(f"| {label} | {escape(provider_status.get(key, '미수집'))} |")
         if shodan_rows:
-            lines += ["<table>",
+            lines += ["", "### Shodan InternetDB 관측", "",
+                      "<table>",
                       "<thead><tr><th>출처</th><th>대상 IP</th><th>포트</th><th>포트 주요 위험</th><th>CPE 단서</th><th>CVE</th><th>CVE 위험</th></tr></thead>",
                       "<tbody>"]
             for row in shodan_rows:
                 lines.extend(shodan_html_rows(row))
             lines += ["</tbody>", "</table>"]
             lines += ["", "CVE는 InternetDB가 반환한 순서대로 최대 8개만 표시합니다. 포트와 CVE는 같은 IP에서의 독립 관측값이며, 같은 행에 있더라도 포트별 CVE 대응을 뜻하지 않습니다."]
+        if censys_rows:
+            lines += ["", "### Censys 관측", "",
+                      "| 대상 IP | 관측 시각 | 포트 | 호스트명 단서 | 제품·서비스 단서 |",
+                      "| --- | --- | --- | --- | --- |"]
+            for row in censys_rows[:20]:
+                lines.append(
+                    f"| {escape(row.get('ip', ''))} | {escape(row.get('observed_at', '') or '시각 미제공')} | "
+                    f"{escape(', '.join(map(str, row.get('ports', []))) or '없음')} | "
+                    f"{escape(', '.join(row.get('hostnames', [])[:5]) or '없음')} | "
+                    f"{escape(', '.join(row.get('products', [])[:5]) or '없음')} |"
+                )
+            lines += ["", "Censys의 관측 정보는 공개 호스트 색인 기록이며, 현재 해당 포트가 열려 있거나 제품이 실제 운영 중이라는 확정 근거는 아닙니다."]
+        if cross_rows:
+            lines += ["", "### Shodan·Censys IP·포트 교차 일치", "",
+                      "같은 IP에서 각 외부 색인이 관측한 포트를 나눠 표시합니다. `통합`은 두 색인에 공통으로 있는 포트만 뜻하며, 현재 공개 상태나 취약점은 확정하지 않습니다.", "",
+                      "| IP | 현재 DNS 일치 | 구분 | 외부 색인 관측 포트 |", "| --- | --- | --- | --- |"]
+            for row in cross_rows[:20]:
+                ports_by_provider = row.get('ports_by_provider', {})
+                shodan_ports = ports_by_provider.get('shodan', [])
+                censys_ports = ports_by_provider.get('censys', [])
+
+                def format_ports(values):
+                    values = sorted({int(value) for value in values if isinstance(value, int)})
+                    visible = ', '.join(map(str, values[:25]))
+                    return visible + (f" 외 {len(values) - 25}개" if len(values) > 25 else '') or '관측 없음'
+
+                common_ports = sorted(set(shodan_ports) & set(censys_ports))
+                integrated = (f"공통: {format_ports(common_ports)}"
+                              if shodan_ports and censys_ports else '공통 비교 불가(한 출처만 관측)')
+                dns_match = '예' if row.get('current_dns_match') else '아니오'
+                lines += [
+                    f"| {escape(row['ip'])} | {dns_match} | Shodan | {escape(format_ports(shodan_ports))} |",
+                    f"|  |  | Censys | {escape(format_ports(censys_ports))} |",
+                    f"|  |  | 통합 | {escape(integrated)} |",
+                ]
         if urlscan_rows:
             current_ips = set(observation.addresses.get('ipv4', [])) | set(observation.addresses.get('ipv6', []))
             same_ip = sum(1 for row in urlscan_rows if row.get('ip') in current_ips)
@@ -396,18 +449,32 @@ def write_report(path, schema, observation, findings, cve_candidates, record_cou
                 path_value = urlsplit(row.get('url', '')).path or '/'
                 if path_value not in paths:
                     paths.append(path_value)
-            lines += ["", f"- urlscan 공개 기록: 동일 호스트 {len(urlscan_rows)}건, 현재 DNS IP 일치 {same_ip}건",
+            lines += ["", "### urlscan 공개 기록", "",
+                      f"- 동일 호스트: {len(urlscan_rows)}건, 현재 DNS IP 일치: {same_ip}건",
                       f"- 과거 관찰 경로: {escape(', '.join(paths[:8]))}"]
+        if credential_exposure:
+            lines += ["", "### 유출 계정 정보", ""]
+            if credential_exposure.get('status') == 'collected':
+                lines += [f"- Intelligence X 색인 확인 레코드: {credential_exposure.get('records_seen', 0)}건",
+                          f"- 중복 제외 계정: {credential_exposure.get('unique_accounts', 0)}개",
+                          f"- 고권한 가능성 후보: **{credential_exposure.get('privileged_count', 0)}개**",
+                          f"- 마스킹된 고권한 후보: {escape(', '.join(credential_exposure.get('privileged_candidates', [])) or '없음')}",
+                          "- 고권한 가능성은 계정명 또는 연결된 관리자형 URL 단서로 분류한 후보이며 실제 권한·현재 활성 여부는 확인되지 않았습니다.",
+                          "- 비밀번호·토큰·비밀값은 수집 결과에서 즉시 폐기했으며 저장하거나 유효성 검증하지 않았습니다."]
+            else:
+                lines.append(f"- Intelligence X: {escape(credential_exposure.get('status', '미수집'))} ({escape(credential_exposure.get('notice', ''))})")
         if include_verification:
             shodan_ip = shodan_rows[0]['ip'] if shodan_rows else '대상-IP'
             shodan_url = f"https://internetdb.shodan.io/{shodan_ip}"
             urlscan_url = f"https://urlscan.io/search/#{quote('domain:' + host)}"
-            lines += ["", "**[Shodan·urlscan 교차검증 사진]**", "",
+            lines += ["", "**[외부 색인 교차검증 사진]**", "",
                       f"1. 브라우저에서 `{escape(shodan_url)}`를 엽니다. JSON 화면의 `ip`, `ports`, `cpes`, `vulns`와 주소창이 보이게 캡처합니다.",
                       f"2. 새 탭에서 `{escape(urlscan_url)}`를 열고 검색 결과 중 도메인이 정확히 `{escape(host)}`인 항목만 확인합니다.",
                       "3. urlscan 결과 한 건을 열어 Summary의 URL·Domain·IP·Scan date가 함께 보이게 캡처합니다. 새 URL 스캔은 제출하지 않습니다.",
-                      f"4. PowerShell에서 `Resolve-DnsName {escape(host)} -Type A`를 실행하고 Name·IPAddress가 보이게 캡처합니다.",
-                      "5. DNS IP와 Shodan·urlscan IP가 같은지 비교하고 사진 아래에 `외부 관측 시각 / 현재 DNS IP / 동일 여부`를 기록합니다."]
+                      "4. Censys는 기존 호스트 조회 결과에서 같은 IP·포트만 확인합니다. Live Rescan 또는 새 스캔 기능은 실행하지 않습니다.",
+                      f"5. PowerShell에서 `Resolve-DnsName {escape(host)} -Type A`를 실행하고 Name·IPAddress가 보이게 캡처합니다.",
+                      "6. DNS IP와 각 색인의 IP가 같은지 비교하고 `관측 출처 / 관측 시각 / 현재 DNS IP / 동일 여부`를 기록합니다.",
+                      "7. 유출 계정 결과는 계정 일부만 보이도록 가리고 비밀번호·토큰·쿠키 값은 캡처하지 않습니다."]
     history = getattr(observation, 'historical_asm', {}) or {}
     if history:
         subdomains = history.get('subdomains', [])

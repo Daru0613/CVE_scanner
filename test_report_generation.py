@@ -7,6 +7,38 @@ from summary_report import write_report
 
 
 class ReportGenerationTests(unittest.TestCase):
+    def test_cross_validation_and_masked_credential_summary_are_rendered(self):
+        observation = SiteObservation(url='https://example.test/', status='200')
+        observation.claim = {'confirmed': False}
+        observation.external_osint = {
+            'collection_status': {'shodan_internetdb': '수집 완료(1건)', 'censys': '수집 완료(1건)',
+                                  'urlscan': '수집 완료(0건)'},
+            'cross_validation': [{
+                'ip': '8.8.8.8', 'providers': ['shodan', 'censys'],
+                'ports_by_provider': {'shodan': [443], 'censys': [443]},
+                'agreement': '2개 출처 일치', 'current_dns_match': True,
+            }],
+            'censys': [{
+                'ip': '8.8.8.8', 'observed_at': '2026-09-08T00:00:00Z',
+                'ports': [443], 'hostnames': ['example.test'], 'products': ['HTTPS'],
+            }],
+            'credential_exposure': {
+                'status': 'collected', 'records_seen': 1, 'unique_accounts': 1,
+                'privileged_count': 1, 'privileged_candidates': ['a***@example.test'],
+            },
+        }
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / 'report.md'
+            write_report(path, [], observation, [], [], 0, False)
+            report = path.read_text(encoding='utf-8')
+            self.assertIn('### Censys 관측', report)
+            self.assertIn('### Shodan·Censys IP·포트 교차 일치', report)
+            self.assertIn('| 8.8.8.8 | 예 | Shodan | 443 |', report)
+            self.assertIn('|  |  | Censys | 443 |', report)
+            self.assertIn('|  |  | 통합 | 공통: 443 |', report)
+            self.assertIn('a&#42;&#42;&#42;@example.test', report)
+            self.assertNotIn('admin@example.test', report)
+
     def test_site_only_history_and_photo_guides(self):
         observation = SiteObservation(url='https://example.test/', status='error')
         observation.claim = {'confirmed': True}
