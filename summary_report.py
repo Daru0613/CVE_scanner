@@ -287,16 +287,16 @@ def osint_evidence(observation):
 
 
 def write_report(path, schema, observation, findings, cve_candidates, record_count, nvd_enabled,
-                 include_verification=False):
+                 include_verification=False, generated_at=None):
     host = urlsplit(observation.url).hostname or observation.url
     claim, sources = observation.claim, observation.sources
     routes = likely_routes(schema, observation, cve_candidates)
     forms, json_rows, keys = evidence_matches(schema, observation)
     strongest = routes[0]['confidence'] if routes else '근거 부족'
-    purpose = "검증용" if include_verification else "노션 기록용"
-    lines = [f"# {escape(host)} — 유출 경로 ASM 보고서 ({purpose})", "", "## 조사 개요", "",
+    generated_at = generated_at or datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    lines = [f"# {escape(host)} — 유출 경로 ASM 보고서", "", "## 조사 개요", "",
              f"- 대상 사이트: {escape(observation.url)}",
-             f"- 조사 시각: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+             f"- 조사 시각: {generated_at}",
              f"- 분석 자료: {len(sources)}개 파일, {record_count}개 레코드, {len(schema)}개 필드"]
     if claim.get('company'):
         lines.append(f"- 기업·서비스명: {escape(claim['company'])}")
@@ -343,14 +343,9 @@ def write_report(path, schema, observation, findings, cve_candidates, record_cou
     lines += ["", "## ASM 의심 항목 — 유력 유출 경로", "",
               "미탐지 항목과 유출 판단에 직접 영향을 주지 않는 일반 설정은 제외했습니다.", ""]
     if routes:
-        if include_verification:
-            lines += ["| 우선순위 | 유력 경로 | 신뢰도 | 연결 근거 | 다음 확인 |", "| ---: | --- | --- | --- | --- |"]
-            for index, item in enumerate(routes, 1):
-                lines.append(f"| {index} | {escape(item['route'])} | {item['confidence']} | {escape(item['evidence'])} | {escape(item['next'])} |")
-        else:
-            lines += ["| 우선순위 | 유력 경로 | 신뢰도 | 연결 근거 |", "| ---: | --- | --- | --- |"]
-            for index, item in enumerate(routes, 1):
-                lines.append(f"| {index} | {escape(item['route'])} | {item['confidence']} | {escape(item['evidence'])} |")
+        lines += ["| 우선순위 | 유력 경로 | 신뢰도 | 연결 근거 | 다음 확인 |", "| ---: | --- | --- | --- | --- |"]
+        for index, item in enumerate(routes, 1):
+            lines.append(f"| {index} | {escape(item['route'])} | {item['confidence']} | {escape(item['evidence'])} | {escape(item['next'])} |")
     else:
         lines.append("자료와 사이트 사이에 자동으로 연결된 유력 경로가 없습니다.")
     if include_verification and forms:
@@ -388,6 +383,9 @@ def write_report(path, schema, observation, findings, cve_candidates, record_cou
     censys_rows = external.get('censys', [])
     cross_rows = external.get('cross_validation', [])
     provider_status = external.get('collection_status', {})
+    collection_evidence = external.get('collection_evidence', {})
+    attribution_rows = external.get('asset_attribution', [])
+    product_evidence = external.get('product_evidence', [])
     credential_exposure = external.get('credential_exposure', {})
     if shodan_rows or censys_rows or urlscan_rows or provider_status or credential_exposure:
         lines += ["", "## 외부 ASM 교차검증", "",
@@ -397,6 +395,21 @@ def write_report(path, schema, observation, findings, cve_candidates, record_cou
             lines += ["| 출처 | 수집 상태 |", "| --- | --- |"]
             for key, label in labels.items():
                 lines.append(f"| {label} | {escape(provider_status.get(key, '미수집'))} |")
+        if collection_evidence:
+            lines += ["", "### 수집 상태 및 증거", "",
+                      "| 출처 | 상태 | 관측 시각 | 시도 | 원시 근거 요약 | 오류 |",
+                      "| --- | --- | --- | ---: | --- | --- |"]
+            labels = {'shodan_internetdb': 'Shodan', 'censys': 'Censys', 'urlscan': 'urlscan'}
+            for key, label in labels.items():
+                item = collection_evidence.get(key, {})
+                lines.append(f"| {label} | {escape(item.get('state', '미수집'))} | {escape(item.get('observed_at', '—'))} | {item.get('attempts', 0)} | {escape(item.get('raw_evidence', '—'))} | {escape(item.get('error', '—') or '—')} |")
+        if attribution_rows:
+            lines += ["", "### 도메인 기준 자산 귀속", "",
+                      "IP는 자산 자체가 아니라 특정 시점의 연결 증거로만 취급합니다. `공유호스팅 추정`과 `귀속 불명` IP의 포트·제품·CVE는 대상 사이트 결과에 합산하지 않습니다.", "",
+                      "| 관측 대상 | IP | 귀속 판정 | 점수 | 신뢰도 | 판정 근거 | 관측 시각 |",
+                      "| --- | --- | --- | ---: | --- | --- | --- |"]
+            for row in attribution_rows:
+                lines.append(f"| {escape(row.get('asset', host))} | {escape(row.get('ip', ''))} | **{escape(row.get('state', '귀속 불명'))}** | {row.get('score', 0)} | {escape(row.get('confidence', '낮음'))} | {escape('; '.join(row.get('evidence', [])))} | {escape(row.get('observed_at', ''))} |")
         if shodan_rows:
             lines += ["", "### Shodan InternetDB 관측", "",
                       "<table>",
@@ -441,6 +454,24 @@ def write_report(path, schema, observation, findings, cve_candidates, record_cou
                     f"|  |  | Censys | {escape(format_ports(censys_ports))} |",
                     f"|  |  | 통합 | {escape(integrated)} |",
                 ]
+        if product_evidence:
+            lines += ["", "### 제품·버전·CPE 근거", "",
+                      "정확한 버전이 없는 배너와 귀속이 확정되지 않은 IP는 CVE에 자동 연결하지 않습니다.", "",
+                      "| IP | 출처 | 자산 귀속 | 원시 제품 근거 | 정확한 버전 | CPE | 판정 |",
+                      "| --- | --- | --- | --- | --- | --- | --- |"]
+            for row in product_evidence[:40]:
+                lines.append(f"| {escape(row.get('ip', ''))} | {escape(row.get('provider', ''))} | {escape(row.get('attribution', '귀속 불명'))} | {escape(row.get('raw_evidence', ''))} | {escape(row.get('exact_version', '') or '미확인')} | {escape(row.get('cpe', '') or '미확인')} | **{escape(row.get('decision', 'CVE 매핑 보류'))}** |")
+        external_cves = []
+        for row in shodan_rows:
+            for cve in row.get('vulns', []):
+                external_cves.append((row.get('ip', ''), cve))
+        if external_cves:
+            attribution_by_ip = {row.get('ip'): row.get('state') for row in attribution_rows}
+            lines += ["", "### 외부 서비스 제공 CVE 후보", "",
+                      "아래 값은 Shodan이 제공한 후보이며 자체 검증 결과가 아닙니다. 제품·정확한 버전·CPE·영향 범위가 연결되지 않으면 `검증 불가`로 유지합니다.", "",
+                      "| IP | CVE | 자산 귀속 | 판정 |", "| --- | --- | --- | --- |"]
+            for ip, cve in external_cves[:30]:
+                lines.append(f"| {escape(ip)} | {escape(cve)} | {escape(attribution_by_ip.get(ip, '귀속 불명'))} | 검증 불가 · 외부 서비스 제공 후보 |")
         if urlscan_rows:
             current_ips = set(observation.addresses.get('ipv4', [])) | set(observation.addresses.get('ipv6', []))
             same_ip = sum(1 for row in urlscan_rows if row.get('ip') in current_ips)
@@ -513,7 +544,7 @@ def write_report(path, schema, observation, findings, cve_candidates, record_cou
                       "3. 보고서의 과거 URL 중 로그인·회원·API 경로를 Wayback 결과 목록에서 검색합니다. 보관된 기록에 있는 URL만 열고 현재 사이트 주소로 바꿔 접속하지 않습니다.",
                       "4. Common Crawl 기록이 있으면 historical.json에서 해당 기록의 source_url을 복사해 브라우저에 붙여넣습니다. 응답에서 대상 URL과 timestamp를 찾습니다. 주소창과 해당 행을 캡처합니다. 기록이 없으면 미수집으로 적습니다.",
                       "5. 사진 아래에 `출처 / 과거 관찰 시각 / hostname 또는 경로 / 현재 자산과의 연관성`을 기록합니다."]
-    if include_verification and observation.manual_review:
+    if observation.manual_review:
         review = observation.manual_review
         lines += ["", "## 수동 미션 판단", "", f"- 종합 위험도: **{escape(review['risk'])}**",
                   f"- 판단: {escape(review['conclusion'])}", f"- 가능 경로: {escape(' / '.join(review['routes']))}", "",

@@ -65,6 +65,25 @@ class ReportGenerationTests(unittest.TestCase):
                 self.assertIn('조사 이유 · 예상 위험', report)
                 self.assertEqual('Win + Shift + S' in report, verification)
 
+    def test_verification_report_only_inserts_guidance(self):
+        observation = SiteObservation(url='https://example.test/', status='200')
+        observation.claim = {'confirmed': False}
+        observation.manual_review = {
+            'risk': '낮음', 'conclusion': '추가 확인', 'routes': ['관리자 계정'],
+            'answers': [{'mission': '계정 확인', 'answer': '미확인'}],
+        }
+        with TemporaryDirectory() as directory:
+            normal = Path(directory) / 'normal.md'
+            verification = Path(directory) / 'verification.md'
+            timestamp = '2026-09-08 00:00 UTC'
+            write_report(normal, [], observation, [], [], 0, False, False, timestamp)
+            write_report(verification, [], observation, [], [], 0, False, True, timestamp)
+            normal_lines = normal.read_text(encoding='utf-8').splitlines()
+            verification_lines = iter(verification.read_text(encoding='utf-8').splitlines())
+            for expected in normal_lines:
+                self.assertTrue(any(line == expected for line in verification_lines),
+                                f'검증 보고서에서 기본 보고서 내용이 누락됨: {expected}')
+
 
 if __name__ == '__main__':
     unittest.main()

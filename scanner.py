@@ -479,10 +479,11 @@ def main() -> int:
         verification_output = args.output.with_name(f'{args.output.stem}_검증{args.output.suffix}')
         if verification_output.resolve() in paths:
             raise ValueError("verification report path must be distinct from inputs and other outputs")
+        report_generated_at = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
         write_report(args.output, schema, observation, findings, cve_candidates, len(rows), nvd_enabled,
-                     include_verification=False)
+                     include_verification=False, generated_at=report_generated_at)
         write_report(verification_output, schema, observation, findings, cve_candidates, len(rows), nvd_enabled,
-                     include_verification=True)
+                     include_verification=True, generated_at=report_generated_at)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

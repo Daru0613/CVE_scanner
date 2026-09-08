@@ -12,6 +12,7 @@ from sql_to_csv import convert
 from env_config import load_local_env
 from osint_sources import (_is_privileged, _mask_account, build_cross_validation,
                            collect_public_osint, query_intelx_accounts, unique_values)
+from asset_attribution import assess_asset_attribution, build_product_evidence
 
 
 class SurfaceExposureTests(unittest.TestCase):
@@ -67,6 +68,21 @@ class SurfaceExposureTests(unittest.TestCase):
         rows = build_cross_validation(data, {"8.8.8.8"})
         self.assertEqual("2개 출처 일치", rows[0]["agreement"])
         self.assertTrue(rows[0]["current_dns_match"])
+
+    def test_asset_attribution_separates_shared_hosting(self):
+        data = {
+            "shodan_internetdb": [{"provider": "shodan", "ip": "8.8.8.8", "hostnames": ["example.test", "other.test"]}],
+            "censys": [{"provider": "censys", "ip": "8.8.8.8", "hostnames": ["example.test"]}],
+        }
+        rows = assess_asset_attribution("example.test", {"8.8.8.8"}, data)
+        self.assertEqual("공유호스팅 추정", rows[0]["state"])
+        self.assertIn("other.test", rows[0]["unrelated_hostnames"])
+
+    def test_product_without_exact_version_is_held_from_cve_mapping(self):
+        data = {"censys": [{"provider": "censys", "ip": "8.8.8.8", "products": ["nginx"]}]}
+        attribution = [{"ip": "8.8.8.8", "state": "대상 전용 추정"}]
+        rows = build_product_evidence(data, attribution)
+        self.assertEqual("CVE 매핑 보류", rows[0]["decision"])
 
     def test_credential_intel_helpers_mask_and_flag_admin_accounts(self):
         self.assertEqual("a***@example.test", _mask_account("admin@example.test"))

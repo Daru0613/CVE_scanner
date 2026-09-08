@@ -16,7 +16,10 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any
+
+from asset_attribution import assess_asset_attribution, build_product_evidence
 
 
 USER_AGENT = "Authorized-Exposure-Triage/0.5"
@@ -278,12 +281,25 @@ def build_cross_validation(data: dict[str, Any], current_ips: set[str]) -> list[
 def collect_public_osint(hostname: str, addresses: dict[str, list[str]], timeout: int,
                          credential_intel: bool = False) -> dict[str, Any]:
     """Collect passive indexes. Provider failures are isolated and summarized."""
-    data: dict[str, Any] = {"collection_status": {}}
+    data: dict[str, Any] = {"collection_status": {}, "collection_evidence": {}}
 
     def error_label(error: Exception) -> str:
         if isinstance(error, urllib.error.HTTPError):
             return f"HTTP {error.code}"
         return type(error).__name__
+
+    def normalized_error(error: Exception) -> str:
+        if isinstance(error, urllib.error.HTTPError) and error.code in {401, 403}:
+            return "접근 거부"
+        if isinstance(error, (TimeoutError,)):
+            return "시간 초과"
+        if isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError):
+            return "시간 초과"
+        if isinstance(error, (urllib.error.URLError, OSError)):
+            return "연결 실패"
+        if isinstance(error, (ValueError, json.JSONDecodeError)):
+            return "파서 오류"
+        return "연결 실패"
 
     providers = [
         ("shodan_internetdb", lambda: query_shodan_internetdb(addresses.get("ipv4", []), timeout), True),
@@ -294,13 +310,26 @@ def collect_public_osint(hostname: str, addresses: dict[str, list[str]], timeout
         if not configured:
             data[name] = []
             data["collection_status"][name] = "미설정(API 키 필요)"
+            data["collection_evidence"][name] = {"state": "미설정", "attempts": 0}
             continue
         try:
             data[name] = operation()
-            data["collection_status"][name] = f"수집 완료({len(data[name])}건)"
+            state = "수집 성공" if data[name] else "결과 없음"
+            data["collection_status"][name] = f"{state}({len(data[name])}건)"
+            data["collection_evidence"][name] = {
+                "state": state, "attempts": 1,
+                "observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "raw_evidence": f"응답 파싱 완료; 결과 {len(data[name])}건", "error": "",
+            }
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as error:
             data[name] = []
-            data["collection_status"][name] = f"수집 실패({error_label(error)})"
+            state = normalized_error(error)
+            data["collection_status"][name] = f"{state}({error_label(error)})"
+            data["collection_evidence"][name] = {
+                "state": state, "attempts": 1,
+                "observed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "raw_evidence": "응답 본문 미저장(비밀값 보호)", "error": error_label(error),
+            }
     if credential_intel:
         key = os.getenv("INTELX_API_KEY", "")
         if not key:
@@ -314,4 +343,6 @@ def collect_public_osint(hostname: str, addresses: dict[str, list[str]], timeout
                 data["credential_exposure"] = {"status": "수집 실패", "notice": error_label(error)}
     current_ips = set(addresses.get("ipv4", [])) | set(addresses.get("ipv6", []))
     data["cross_validation"] = build_cross_validation(data, current_ips)
+    data["asset_attribution"] = assess_asset_attribution(hostname, current_ips, data)
+    data["product_evidence"] = build_product_evidence(data, data["asset_attribution"])
     return data
